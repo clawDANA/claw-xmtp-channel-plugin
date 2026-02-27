@@ -35,19 +35,14 @@ export async function monitorXmtp(params: {
 
   log.info?.(`[xmtp:${accountId}] agent created | address=${agent.address} inboxId=${agent.client?.inboxId}`);
 
-  // ── Shared message handler for both DM and group text messages ──
-  const handleTextMessage = async (ctx: any) => {
-    // Ignore our own messages
-    if (filter.fromSelf(ctx.message, agent.client)) return;
-
+  // ── Shared message dispatcher ──
+  const dispatch = async (ctx: any, text: string, extras: Record<string, any> = {}) => {
     const senderAddress = await ctx.getSenderAddress().catch(() => null);
     const from = senderAddress ?? ctx.message.senderInboxId;
-    const text: string = String(ctx.message.content);
     const convId = ctx.conversation.id;
     const isGroup = ctx.conversation.isGroup?.() ?? ("members" in ctx.conversation);
     const chatType = isGroup ? "group" : "direct";
 
-    // For groups: use convId as session key; for DMs: use sender address
     const sessionKey = isGroup
       ? `xmtp:${accountId}:group:${convId}`
       : `xmtp:${accountId}:${from}`;
@@ -78,6 +73,8 @@ export async function monitorXmtp(params: {
         OriginatingTo: agent.address,
         // Group-specific metadata
         ...(isGroup ? { GroupId: convId, GroupName: ctx.conversation.name } : {}),
+        // Reply-specific metadata
+        ...extras,
       });
 
       await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -88,8 +85,12 @@ export async function monitorXmtp(params: {
             const replyText: string = payload.text ?? "";
             if (!replyText) return;
             try {
-              // Reply to the same conversation (DM or group)
-              await ctx.conversation.sendText(replyText);
+              // If the incoming message was a reply, respond as a reply too
+              if (extras.IsReply && ctx.sendTextReply) {
+                await ctx.sendTextReply(replyText);
+              } else {
+                await ctx.conversation.sendText(replyText);
+              }
               log.info?.(`[xmtp:${accountId}] out [${chatType}] convId=${convId} text="${replyText.slice(0, 80)}"`);
             } catch (err: any) {
               log.error?.(`[xmtp:${accountId}] deliver error: ${err.message ?? err}`);
@@ -105,8 +106,43 @@ export async function monitorXmtp(params: {
     }
   };
 
+  // ── Handle plain text messages ──
+  const handleTextMessage = async (ctx: any) => {
+    if (filter.fromSelf(ctx.message, agent.client)) return;
+    const text: string = String(ctx.message.content ?? "");
+    if (!text) return;
+    await dispatch(ctx, text);
+  };
+
+  // ── Handle reply messages (user replies to a message) ──
+  const handleReplyMessage = async (ctx: any) => {
+    if (filter.fromSelf(ctx.message, agent.client)) return;
+
+    const replyContent = ctx.message.content;
+    // Extract text: could be string directly or nested in .content
+    let text: string;
+    if (typeof replyContent?.content === "string") {
+      text = replyContent.content;
+    } else if (typeof replyContent?.content?.text === "string") {
+      text = replyContent.content.text;
+    } else {
+      text = String(replyContent?.content ?? "");
+    }
+
+    if (!text) return;
+
+    const referenceId: string | undefined = replyContent?.reference;
+    log.info?.(`[xmtp:${accountId}] reply received, reference=${referenceId} text="${text.slice(0, 80)}"`);
+
+    await dispatch(ctx, text, {
+      IsReply: true,
+      ReplyToMessageId: referenceId,
+    });
+  };
+
   // ── Register event handlers ──
   agent.on("text", handleTextMessage);
+  agent.on("reply", handleReplyMessage);
 
   agent.on("group", (ctx: any) => {
     log.info?.(`[xmtp:${accountId}] joined group: ${ctx.conversation.id} name=${ctx.conversation.name ?? "(unnamed)"}`);
@@ -123,6 +159,10 @@ export async function monitorXmtp(params: {
     agent.on("start", () => {
       log.info?.(`[xmtp:${accountId}] ✅ ready | address=${agent.address}`);
       registerAgent(accountId, agent);
+      // Sync all conversations (picks up new groups added after last start)
+      agent.client?.conversations?.syncAllConversations?.()
+        .then(() => log.info?.(`[xmtp:${accountId}] conversations synced`))
+        .catch((e: any) => log.warn?.(`[xmtp:${accountId}] sync warn: ${e?.message}`));
       resolve();
     });
     agent.on("unhandledError", (err: any) => reject(err));
@@ -153,3 +193,4 @@ export async function monitorXmtp(params: {
 
   return { stop };
 }
+
